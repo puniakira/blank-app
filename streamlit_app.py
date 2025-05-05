@@ -6,6 +6,7 @@ import pandas as pd
 from datetime import datetime, date
 import google.generativeai as genai
 import re # 正規表現のため
+import traceback # エラー詳細表示用
 
 # --- PAGE CONFIG (MUST BE FIRST ST COMMAND) ---
 st.set_page_config(page_title="e-Gov 法令検索 AI", layout="wide")
@@ -40,7 +41,7 @@ except Exception as e:
     GEMINI_ENABLED = False
 
 
-# --- API Helper Functions (parse_api_response, _fetch_specific_type, fetch_law_list は変更なし) ---
+# --- API Helper Functions ---
 def parse_api_response(xml_text):
     try:
         if xml_text.startswith('\ufeff'): xml_text = xml_text[1:]
@@ -94,7 +95,6 @@ def fetch_law_list(requested_law_type_code):
         if not laws: return None; return laws
     else: st.error(f"無効な法令種別コード: {requested_law_type_code}"); return None
 
-# ★★★ fetch_law_data_for_ai (変更なし - XMLからテキスト抽出) ★★★
 @st.cache_data(ttl=3600)
 def fetch_law_data_for_ai(law_id):
     if not law_id: return None, "Error: Law ID required."
@@ -133,7 +133,33 @@ def fetch_law_data_for_ai(law_id):
 
 
 # --- Gemini Interaction Functions ---
-# ★★★ プロンプトに引用指示を追加 ★★★
+# ★★★ get_gemini_summary 関数の定義 ★★★
+def get_gemini_summary(text_content):
+    """Gets a summary from Gemini."""
+    if not GEMINI_ENABLED: return "AI機能は無効です。"
+    if not text_content: return "要約対象のテキストがありません。"
+    try:
+        prompt = f"""以下の日本の法令本文を200〜300字程度で簡潔に要約してください。\n\n--- 法令本文 ---\n{text_content}\n--- ここまで ---\n\n--- 要約 ---"""
+        response = gemini_model.generate_content(prompt)
+        if response.parts:
+             return response.text
+        else:
+             # 詳細なエラー情報を取得しようと試みる
+             try:
+                 reason = response.candidates[0].finish_reason if response.candidates else "Unknown"
+                 safety_ratings = response.candidates[0].safety_ratings if response.candidates else "N/A"
+                 prompt_feedback = response.prompt_feedback if hasattr(response, 'prompt_feedback') else "N/A"
+                 error_detail = f"Reason: {reason}, Safety Ratings: {safety_ratings}, Prompt Feedback: {prompt_feedback}"
+             except Exception:
+                 error_detail = "Could not retrieve detailed error reason."
+             st.error(f"Gemini 要約エラー: 応答が空です。{error_detail}", icon="🚨")
+             return f"要約を生成できませんでした。{error_detail}"
+    except Exception as e:
+        st.error(f"Gemini 要約エラーが発生しました: {type(e).__name__} - {e}", icon="🚨")
+        st.error("詳細なエラー情報:")
+        st.code(traceback.format_exc()) # トレースバックを表示
+        return "要約の生成中に予期せぬエラーが発生しました。"
+
 def get_gemini_chat_response(context, history, user_question):
     if not GEMINI_ENABLED: return "AI機能は無効です。"
     if not context: return "チャットのコンテキスト（法令本文）がありません。"
@@ -152,69 +178,51 @@ def get_gemini_chat_response(context, history, user_question):
         response = gemini_model.generate_content(messages_for_api)
         if response.parts: return response.text
         else:
-             reason = response.candidates[0].finish_reason if response.candidates else "Unknown"
+             try:
+                 reason = response.candidates[0].finish_reason if response.candidates else "Unknown"
+                 safety_ratings = response.candidates[0].safety_ratings if response.candidates else "N/A"
+                 prompt_feedback = response.prompt_feedback if hasattr(response, 'prompt_feedback') else "N/A"
+                 error_detail = f"Reason: {reason}, Safety Ratings: {safety_ratings}, Prompt Feedback: {prompt_feedback}"
+             except Exception:
+                 error_detail = "Could not retrieve detailed error reason."
+             st.error(f"Gemini チャットエラー: 応答が空です。{error_detail}", icon="🚨")
              if reason == genai.types.FinishReason.SAFETY: return "回答が安全基準によりブロックされました。"
              elif reason == genai.types.FinishReason.RECITATION: return "回答が引用制限によりブロックされました。"
-             else: return f"回答を生成できませんでした。理由コード: {reason}"
-    except Exception as e: st.error(f"Gemini チャットエラー: {e}", icon="🚨"); return "チャット応答の生成中にエラーが発生しました。"
+             else: return f"回答を生成できませんでした。{error_detail}"
+    except Exception as e:
+        st.error(f"Gemini チャットエラーが発生しました: {type(e).__name__} - {e}", icon="🚨")
+        st.error("詳細なエラー情報:")
+        st.code(traceback.format_exc()) # トレースバックを表示
+        return "チャット応答の生成中に予期せぬエラーが発生しました。"
 
-# ★★★ 引用元条文を抽出・検索するヘルパー関数 ★★★
+
+# --- Citation Helper Functions ---
 def extract_citations(ai_response_text):
-    """AIの応答テキストから【引用元: ...】の部分を探し、条文番号のリストを返す"""
     citations = []
-    # 【引用元: 第〇条】 や 【引用元: 第〇条、第△条】 などを探す
     match = re.search(r"【引用元:\s*(.+?)\s*】", ai_response_text)
     if match:
         source_text = match.group(1).strip()
         if source_text != "なし":
-            # "第〇条" の形式を抽出 (漢数字にも対応できるように簡易的に)
-            # 例: "第一条"、"第百二十三条"、"第5条の2" などに対応 (複雑なものは未対応)
-            # "、" や "及び" で区切られている可能性も考慮
             potential_articles = re.findall(r"(?:第(?:[一二三四五六七八九十百千]+|[0-9]+)(?:条(?:の[一二三四五六七八九十百千]|[0-9]+)*)?)", source_text)
             citations.extend(potential_articles)
     return citations
 
-def kanji_to_arabic(kanji_num):
-    """簡易的な漢数字（一〜九千九百九十九）をアラビア数字に変換"""
-    # 簡単のため、ここでは基本的な一桁のみ対応（必要ならライブラリ等で拡張）
-    kanji_map = {'一': '1', '二': '2', '三': '3', '四': '4', '五': '5', '六': '6', '七': '7', '八': '8', '九': '9'}
-    # TODO: 十、百、千や「の」を含むより複雑な変換ロジックを追加
-    arabic_num_str = ""
-    for char in kanji_num:
-        arabic_num_str += kanji_map.get(char, char) # マップにない文字はそのまま
-    return arabic_num_str
-
 def find_article_text(full_law_text, article_title):
-    """
-    法令全文テキストから指定された条のテキスト（次の条まで）を抽出する試み。
-    article_title は "第一条" や "第5条の2" のような形式を想定。
-    """
-    if not full_law_text or not article_title:
-        return None
-
-    # 簡易的な正規表現: 「第〇条」で始まり、次の「第△条」の前までを非貪欲にマッチ
-    # re.DOTALL で改行も"."にマッチさせる
-    # 漢数字とアラビア数字の両方を考慮 (簡易)
-    # 例: article_title = "第一条" -> pattern_str = r"(第一条\s*.*?)(?=第二条|\Z)" (次の条を推測する必要あり)
-    # より汎用的に: 次の「第〜条」が現れるまでを探す
-    pattern_str = rf"({re.escape(article_title)}\s*.*?)(?=第(?:[一二三四五六七八九十百千]+|[0-9]+)(?:条(?:の[一二三四五六七八九十百千]|[0-9]+)*)?|\Z)"
+    if not full_law_text or not article_title: return None
+    # Ensure article_title is treated as literal string in regex
+    escaped_title = re.escape(article_title)
+    # Regex to find the article title and capture everything until the next article title or end of string
+    # (?:\s*\n)* allows for optional whitespace/newlines after the title
+    # Using non-greedy match .*?
+    # Lookahead (?=...) for the next article title or end of string (\Z)
+    pattern_str = rf"({escaped_title}(?:\s*\n)*.*?)(?=第(?:[一二三四五六七八九十百千]+|[0-9]+)(?:条(?:の[一二三四五六七八九十百千]|[0-9]+)*)?|\Z)"
     match = re.search(pattern_str, full_law_text, re.DOTALL)
-
     if match:
         return match.group(1).strip()
-    else:
-        # 単純な文字列検索でフォールバック
+    else: # Fallback: simple find - less accurate for end boundary
         start_index = full_law_text.find(article_title)
-        if start_index != -1:
-            # 次の条が見つからない場合、末尾までか、一定文字数で区切る？
-             end_index = full_law_text.find("第", start_index + len(article_title)) # 次の「第」を探す
-             if end_index != -1:
-                 # 次の「第」が本当に条の始まりか判断するのは難しい
-                 # とりあえず次の「第」の前までを返す（精度は低い）
-                 return full_law_text[start_index:end_index].strip()
-             else:
-                 return full_law_text[start_index:].strip() # 末尾まで
-        return None # 見つからなかった
+        if start_index != -1: return full_law_text[start_index:].strip() # Return from start to end
+        return None
 
 # --- Filtering Function (変更なし) ---
 def filter_laws(laws, name_query, num_query, keyword_query, date_from, date_to):
@@ -232,6 +240,7 @@ def filter_laws(laws, name_query, num_query, keyword_query, date_from, date_to):
 
 
 # --- Streamlit UI ---
+# ... (Title, Caption, Sidebar, Session State Init - 変更なし) ...
 st.title("e-Gov 法令検索システム (AI機能付き)")
 st.caption("法令名を検索・ソートし、AIによる要約や質問応答を利用できます。質問応答では引用元条文も表示します。")
 st.sidebar.header("検索条件 (Search Criteria)")
@@ -246,20 +255,20 @@ with col1: date_from = st.date_input("公布日 From", value=None, max_value=tod
 with col2: date_to = st.date_input("公布日 To", value=today, max_value=today)
 if date_from and date_to and date_from > date_to: st.sidebar.error("Error: 'From' date cannot be after 'To' date."); search_clicked = False
 else: search_clicked = st.sidebar.button("検索実行 (Search)")
-# Session State Init (変更なし)
 if 'search_results_raw' not in st.session_state: st.session_state.search_results_raw = None
 if 'filtered_results_df' not in st.session_state: st.session_state.filtered_results_df = pd.DataFrame()
 current_selection_code_init = LAW_TYPES.get(st.session_state.get('selected_law_type_name', "すべて (All)"), '1'); current_default_sort_col_init = DEFAULT_ALL_TYPE_SORT_COLUMN if current_selection_code_init == '1' else DEFAULT_SPECIFIC_TYPE_SORT_COLUMN; current_default_sort_asc_init = DEFAULT_ALL_TYPE_SORT_ASCENDING if current_selection_code_init == '1' else DEFAULT_SPECIFIC_TYPE_SORT_ASCENDING
 if 'sort_column' not in st.session_state: st.session_state.sort_column = current_default_sort_col_init
 if 'sort_ascending' not in st.session_state: st.session_state.sort_ascending = current_default_sort_asc_init
-if 'summarize_law_id' not in st.session_state: st.session_state.summarize_law_id = None; 
-if 'current_summary' not in st.session_state: st.session_state.current_summary = None; 
+if 'summarize_law_id' not in st.session_state: st.session_state.summarize_law_id = None;
+if 'current_summary' not in st.session_state: st.session_state.current_summary = None;
 if 'summary_loading' not in st.session_state: st.session_state.summary_loading = False
-if 'qa_law_id' not in st.session_state: st.session_state.qa_law_id = None; 
-if 'qa_law_name' not in st.session_state: st.session_state.qa_law_name = None; 
-if 'qa_law_context' not in st.session_state: st.session_state.qa_law_context = None; 
-if 'qa_chat_history' not in st.session_state: st.session_state.qa_chat_history = []; 
+if 'qa_law_id' not in st.session_state: st.session_state.qa_law_id = None;
+if 'qa_law_name' not in st.session_state: st.session_state.qa_law_name = None;
+if 'qa_law_context' not in st.session_state: st.session_state.qa_law_context = None;
+if 'qa_chat_history' not in st.session_state: st.session_state.qa_chat_history = [];
 if 'qa_loading' not in st.session_state: st.session_state.qa_loading = False
+
 
 # --- Search Execution (変更なし) ---
 if search_clicked:
@@ -273,19 +282,40 @@ if search_clicked:
         else: st.session_state.filtered_results_df = pd.DataFrame()
 
 # --- Logic to Fetch Data for AI actions (変更なし) ---
+# このブロックで get_gemini_summary が呼ばれる前に、上記の Gemini Interaction Functions セクションで定義されている必要がある
 if st.session_state.summary_loading and st.session_state.summarize_law_id:
-     summary_law_id = st.session_state.summarize_law_id; law_text, error = fetch_law_data_for_ai(summary_law_id)
-     if error: st.session_state.current_summary = f"要約のための本文取得エラー: {error}"; st.error(st.session_state.current_summary)
-     elif law_text: st.session_state.current_summary = get_gemini_summary(law_text)
-     else: st.session_state.current_summary = "要約対象の法令本文が見つかりませんでした (本文空)。"
-     st.session_state.summary_loading = False; st.rerun()
-if st.session_state.qa_loading and st.session_state.qa_law_id:
-     qa_law_id_fetch = st.session_state.qa_law_id; law_text, error = fetch_law_data_for_ai(qa_law_id_fetch)
-     if error: st.error(f"Q&Aのための本文取得エラー ({qa_law_id_fetch}): {error}"); st.session_state.qa_law_id = None; st.session_state.qa_loading = False; st.rerun()
-     elif law_text: st.session_state.qa_law_context = law_text; st.session_state.qa_loading = False; st.rerun()
-     else: st.error(f"Q&A対象の法令本文が見つかりませんでした ({qa_law_id_fetch})。"); st.session_state.qa_law_id = None; st.session_state.qa_loading = False; st.rerun()
+     summary_law_id = st.session_state.summarize_law_id
+     law_text, error = fetch_law_data_for_ai(summary_law_id)
+     if error:
+         st.session_state.current_summary = f"要約のための本文取得エラー: {error}"
+         st.error(st.session_state.current_summary) # Show error immediately
+     elif law_text:
+         st.session_state.current_summary = get_gemini_summary(law_text) # ★★★ ここでエラーが発生していた ★★★
+     else:
+         st.session_state.current_summary = "要約対象の法令本文が見つかりませんでした (本文空)。"
+     st.session_state.summary_loading = False
+     st.rerun() # Rerun NOW to display the loaded summary or error
 
-# --- AI Feature Display Area ---
+if st.session_state.qa_loading and st.session_state.qa_law_id:
+     qa_law_id_fetch = st.session_state.qa_law_id
+     law_text, error = fetch_law_data_for_ai(qa_law_id_fetch)
+     if error:
+         st.error(f"Q&Aのための本文取得エラー ({qa_law_id_fetch}): {error}")
+         st.session_state.qa_law_id = None # Close Q&A section if context fails
+         st.session_state.qa_loading = False
+         st.rerun()
+     elif law_text:
+         st.session_state.qa_law_context = law_text
+         st.session_state.qa_loading = False
+         st.rerun() # Rerun NOW to make context available and display Q&A section
+     else:
+         st.error(f"Q&A対象の法令本文が見つかりませんでした ({qa_law_id_fetch})。")
+         st.session_state.qa_law_id = None
+         st.session_state.qa_loading = False
+         st.rerun()
+
+
+# --- AI Feature Display Area (変更なし) ---
 summary_placeholder = st.empty(); qa_placeholder = st.empty()
 # Display Summary (変更なし)
 if st.session_state.summarize_law_id and not st.session_state.summary_loading:
@@ -294,33 +324,24 @@ if st.session_state.summarize_law_id and not st.session_state.summary_loading:
         if st.session_state.current_summary: st.markdown(st.session_state.current_summary)
         else: st.warning("要約を表示できません。エラーを確認してください。")
         if st.button("要約を閉じる", key="close_summary"): st.session_state.summarize_law_id = None; st.session_state.current_summary = None; st.rerun()
-
-# Display Q&A (★ 引用表示ロジック追加)
+# Display Q&A (変更なし)
 if st.session_state.qa_law_id and not st.session_state.qa_loading:
     with qa_placeholder.container(border=True):
         st.subheader(f"💬 法令に関する質問 ({st.session_state.qa_law_name or st.session_state.qa_law_id})")
         if st.session_state.qa_law_context is None : st.error("法令コンテキストを読み込めなかったため、質問を開始できません。")
         else:
-            # Display chat history
             for i, message in enumerate(st.session_state.qa_chat_history):
                 with st.chat_message(message["role"]):
                     st.markdown(message["content"])
-                    # ★ AIの回答の後に引用元を表示
                     if message["role"] == "assistant":
                         citations = extract_citations(message["content"])
                         if citations:
                             with st.expander("引用元条文（AIによる推定）", expanded=False):
                                 for cited_article_title in citations:
                                     cited_text = find_article_text(st.session_state.qa_law_context, cited_article_title)
-                                    if cited_text:
-                                        st.caption(f"--- {cited_article_title} ---")
-                                        st.text(cited_text) # textで整形を維持
-                                        st.caption("---")
-                                    else:
-                                        st.warning(f"引用元「{cited_article_title}」の本文をコンテキスト内から見つけられませんでした。")
+                                    if cited_text: st.caption(f"--- {cited_article_title} ---"); st.text(cited_text); st.caption("---")
+                                    else: st.warning(f"引用元「{cited_article_title}」の本文をコンテキスト内から見つけられませんでした。")
                                 st.caption("※AIが示した引用元であり、正確性は保証されません。")
-
-            # Chat input
             if prompt := st.chat_input("法令について質問を入力してください..."):
                 st.session_state.qa_chat_history.append({"role": "user", "content": prompt})
                 with st.chat_message("user"): st.markdown(prompt)
@@ -330,12 +351,11 @@ if st.session_state.qa_law_id and not st.session_state.qa_loading:
                         response_text = get_gemini_chat_response(st.session_state.qa_law_context, st.session_state.qa_chat_history[:-1], prompt)
                         message_placeholder.markdown(response_text)
                 st.session_state.qa_chat_history.append({"role": "assistant", "content": response_text})
-                st.rerun() # ★ 新しいメッセージと引用元を表示するためにリラン
-
+                st.rerun()
         if st.button("チャットを終了", key="close_qa"): st.session_state.qa_law_id = None; st.session_state.qa_law_name = None; st.session_state.qa_law_context = None; st.session_state.qa_chat_history = []; st.rerun()
 
 
-# --- Display Search Results (表示部分は変更なし) ---
+# --- Display Search Results (変更なし) ---
 st.divider(); st.header("検索結果 (Search Results)")
 results_df = st.session_state.filtered_results_df
 if not results_df.empty:
